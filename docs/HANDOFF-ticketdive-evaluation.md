@@ -82,6 +82,22 @@ done
 
 参考：环境与网络策略配置见 https://code.claude.com/docs/en/claude-code-on-the-web
 
+### 2.6 首要嫌疑：账号下有**两个同名 `Default` 环境**
+
+`list_environments` 返回：
+
+| environment_id | name | description | created_at |
+|---|---|---|---|
+| `env_01BDZXDL1wKv57ewc9sEQJYL` | Default | Default - trusted network access | 2026-08-04T07:08:59.490Z |
+| `env_01VWC5ShGBTGPM5AeNF2HFvC` | Default | Default - trusted network access | 2026-08-04T07:08:59.219Z |
+
+两个环境**同名、同描述、创建时间只差 0.27 秒**，在 UI 上几乎无法区分。
+写作本文时的会话 `session_01N5KdiwtW8EsaZ6ixzHzrMJ` 跑在 **`env_01BDZXDL1wKv57ewc9sEQJYL`**。
+
+**白名单很可能加到了另一个环境上。** 排查时务必核对 environment_id，不能只看名字。
+
+另外注意两个环境的网络模式都是 **"trusted network access"** 预设 —— 这与实测吻合（GitHub / npm 通，example.com 与 google.com 不通）。这类预设是平台策划好的可信域名白名单；要放行 ticketdive.com 这种任意第三方域名，可能需要把网络模式切换到支持自定义域名的档位，而不是在预设档位下追加域名。**此点为推断，未在产品 UI 侧核实**，排查时一并确认。
+
 ---
 
 ## 3. 已知的 TicketDive 公开信息
