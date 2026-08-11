@@ -1,0 +1,7 @@
+services:
+  ticket:
+    build: .
+    restart: unless-stopped
+    ports: ["127.0.0.1:8000:8000"]   # 对外由 Caddy/nginx 上 TLS，别直接裸奔
+    env_file: .env
+    volumes: ["./data:/data"]
