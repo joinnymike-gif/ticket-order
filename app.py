@@ -1,369 +1,304 @@
 #!/usr/bin/env python3
-"""TicketDive 无料チケット 自动申领 → 电子票截图 → 邮件发送。
+"""无料チケット 自动申领：HTTP 服务 + 单线程 worker。
 
-前端表单收「昵称 + 邮箱」，后台用运营方账号在 ticketdive.com 走完申込流水线，
-再把 /ticket/<id> 票面截图寄给用户。单文件、单进程、串行执行。
+前端 static/ 直出，API 走 JSON。后台可配 TicketDive 账号、名额、开关。
+串行执行 —— 定位新票靠申请前后集合差，并发会认错人（见 pipeline.pick_new）。
 
 自检：python3 app.py --selfcheck
-空跑：DRY_RUN=1 python3 app.py   # 走到最后一步不点「申し込みを完了する」
 """
-import html
+import hmac
+import json
 import logging
+import mimetypes
 import os
-import pathlib
 import queue
 import re
-import secrets
-import smtplib
-import sqlite3
 import sys
 import threading
-import time
-from email.message import EmailMessage
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, urlparse
 
-BASE = "https://ticketdive.com"
-EVENT_SLUG = os.environ.get("EVENT_SLUG", "nico_202608221")
-TICKET_NAME = os.environ.get("TICKET_NAME", "無料チケット0円")   # 票种名前缀，用于在活动页定位卡片
-ARTIST_ANSWER = os.environ.get("ARTIST_ANSWER", "ニコニコ♡CREAM")  # 「お目当ての出演者」必填项的答案
-DB_PATH = os.environ.get("DB_PATH", "/data/jobs.db")
-SHOTS = pathlib.Path(os.environ.get("SHOTS_DIR", "/data/tickets"))
-PUBLIC_URL = os.environ.get("PUBLIC_URL", "http://localhost:8000").rstrip("/")
+import pipeline
+import store
+
 PORT = int(os.environ.get("PORT", "8000"))
-DRY_RUN = os.environ.get("DRY_RUN") == "1"
+STATIC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
+EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[a-zA-Z]{2,}$")
+TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{16,64}$")     # 挡住 ../ 之类的路径穿越
 
 log = logging.getLogger("ticket")
-
-
-def env(name):
-    v = os.environ.get(name)
-    if not v:
-        sys.exit(f"缺少环境变量 {name}")
-    return v
-
-
-# ---------------------------------------------------------------- 纯逻辑
-
-EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[a-zA-Z]{2,}$")
-
-
-def pick_new(before, after):
-    """申请前后的票 id 集合做差 —— 定位刚下单的那张票。
-
-    共用账号下票面无法按昵称区分，只能靠差集；因此流水线必须串行（见 WORKER）。
-    """
-    new = after - before
-    if not new:
-        return None
-    if len(new) > 1:
-        raise RuntimeError(f"出现多张新票 {sorted(new)}，无法确定归属，已中止")
-    return new.pop()
-
-
-def claim(db, email, nickname):
-    """登记一次申领，返回查看用 token；同一邮箱重复提交返回 None。
-
-    名额是主办方的，别超发。token 是查看票面的唯一凭据 —— 只随邮件发给本人，
-    不用邮箱查票：邮箱可猜，等于谁都能调出别人的入场二维码。
-    """
-    token = secrets.token_urlsafe(16)
-    try:
-        with db:
-            db.execute(
-                "INSERT INTO claim(email, nickname, ts, status, token) VALUES (?,?,?,'queued',?)",
-                (email.strip().lower(), nickname, time.strftime("%F %T"), token),
-            )
-        return token
-    except sqlite3.IntegrityError:
-        return None
-
-
-def open_db(path):
-    db = sqlite3.connect(path, check_same_thread=False)
-    db.execute(
-        "CREATE TABLE IF NOT EXISTS claim("
-        "email TEXT PRIMARY KEY, nickname TEXT, ts TEXT, status TEXT,"
-        " ticket_id TEXT, error TEXT, token TEXT UNIQUE)"
-    )
-    return db
-
-
-# ---------------------------------------------------------------- 浏览器流水线
-
-def login(page):
-    page.goto(f"{BASE}/signin", wait_until="domcontentloaded")
-    page.locator("input[type=email]").fill(env("TD_EMAIL"))
-    page.locator("input[type=password]").fill(env("TD_PASSWORD"))
-    page.get_by_role("button", name="ログインする").click()
-    page.wait_for_url(lambda u: "/signin" not in u, timeout=30_000)
-
-
-def ticket_ids(page):
-    """/ticket 列表里的票 id 集合。
-
-    列表按 (applicationId, stageId) 分组，每组渲染一个 <a href="/ticket/{组内第一张票.id}">，
-    而每次申込 = 一个新 applicationId = 一个新 <a>，所以集合差能唯一定位本次下的票。
-    走 #all：默认视图只显示未来场次，活动日一过就再也 diff 不出来。
-    必须整页 goto —— 列表用 React Query 缓存（staleTime:Infinity, refetchOnMount:false），
-    客户端路由跳回来拿到的是旧数据。
-    """
-    page.goto(f"{BASE}/ticket#all", wait_until="networkidle")
-    hrefs = page.eval_on_selector_all(
-        "a[href^='/ticket/']", "els => els.map(e => e.getAttribute('href'))"
-    )
-    return {h.split("/")[2] for h in hrefs if h.count("/") >= 2 and h.split("/")[2]}
-
-
-def fill_labeled(page, label, value):
-    """按可见文案填输入框。CSS module 的类名带哈希，每次发版都变，只能锚文案。"""
-    try:
-        page.get_by_label(label).fill(value)
-        return
-    except Exception:
-        pass
-    box = page.get_by_text(label, exact=True).first.locator("xpath=ancestor::*[.//input][1]")
-    box.locator("input").first.fill(value)
-
-
-def apply_free_ticket(page, nickname):
-    page.goto(f"{BASE}/event/{EVENT_SLUG}", wait_until="networkidle")
-    # 票种卡片 = 含票名文案、且往上第一个带 <select> 的祖先节点
-    card = page.get_by_text(TICKET_NAME).first.locator("xpath=ancestor::*[.//select][1]")
-    card.locator("select").first.select_option("1")
-    page.get_by_role("button", name="申し込みをする").click()
-    page.wait_for_url("**/apply", timeout=30_000)
-
-    fill_labeled(page, "ニックネーム", nickname)
-    for sel in page.locator("select").all():          # 「お目当ての出演者」必填
-        if ARTIST_ANSWER in sel.inner_text():
-            sel.select_option(label=ARTIST_ANSWER)
-    # ponytail: 不自动勾任何 checkbox —— 页面上可能混着 DM 订阅之类的可选项，
-    # 空跑一次确认这页到底需不需要勾选，需要就在这里点名勾。
-
-    if DRY_RUN:
-        log.warning("DRY_RUN：停在申込页，未提交。%s", page.url)
-        return False
-    page.get_by_role("button", name="申し込みを完了する").click()
-    page.get_by_text("申込完了").wait_for(timeout=90_000)
-    return True
-
-
-def wait_for_ticket(page, before, tries=15):
-    """发券有延迟，轮询到新票出现为止。"""
-    for _ in range(tries):
-        tid = pick_new(before, ticket_ids(page))
-        if tid:
-            return tid
-        time.sleep(2)
-    raise RuntimeError("申込已完成，但 /ticket 未出现新票")
-
-
-def run_pipeline(nickname, email):
-    from playwright.sync_api import sync_playwright
-
-    with sync_playwright() as p:
-        browser = p.chromium.launch(args=["--no-sandbox"])
-        page = browser.new_page(locale="ja-JP", viewport={"width": 430, "height": 932})
-        try:
-            login(page)
-            before = ticket_ids(page)
-            if not apply_free_ticket(page, nickname):
-                return None, None
-            tid = wait_for_ticket(page, before)
-            page.goto(f"{BASE}/ticket/{tid}", wait_until="networkidle")
-            page.wait_for_timeout(1500)  # 等二维码画完
-            # 绝不点「入場する」—— 站点写明该操作不可撤销
-            return tid, page.screenshot(full_page=True)
-        finally:
-            browser.close()
-
-
-# ---------------------------------------------------------------- 邮件
-
-def send_mail(to, nickname, tid, png, token):
-    m = EmailMessage()
-    m["Subject"] = f"【ニコくり周年ライブ0822】無料チケットのお申し込みが完了しました（{nickname} 様）"
-    m["From"] = env("MAIL_FROM")
-    m["To"] = to
-    m.set_content(
-        f"{nickname} 様\n\n無料チケットのお申し込みが完了しました。\n"
-        f"控えページ: {PUBLIC_URL}/t/{token}\n"
-        f"チケット画面: {BASE}/ticket/{tid}\n\n"
-        "※控えページのURLはあなた専用です。他人に共有しないでください。\n"
-        "※ご入場の際は必ずご自身でチケット画面を開いてご提示ください。\n"
-        "　スクリーンショットの提示では入場をお断りする場合があります。\n"
-    )
-    m.add_attachment(png, maintype="image", subtype="png", filename=f"ticket-{tid}.png")
-    with smtplib.SMTP_SSL(env("SMTP_HOST"), int(os.environ.get("SMTP_PORT", "465"))) as s:
-        s.login(env("SMTP_USER"), env("SMTP_PASS"))
-        s.send_message(m)
-
-
-# ---------------------------------------------------------------- 队列 + HTTP
-
 JOBS = queue.Queue()
 
 
-def shot_path(token):
-    return SHOTS / f"{token}.png"
-
+# ---------------------------------------------------------------- worker
 
 def worker(db):
     while True:
-        email, nickname, token = JOBS.get()
+        email = JOBS.get()
+        row = store.by_email(db, email)
+        if not row:
+            continue
+        cfg, token, nickname = store.settings(db), row["token"], row["nickname"]
         try:
-            tid, png = run_pipeline(nickname, email)
+            tid, png = pipeline.run(cfg, nickname, lambda s: store.set_stage(db, email, s))
             if tid:
-                shot_path(token).write_bytes(png)     # 落盘后再发信，失败可重发不用重截
-                send_mail(email, nickname, tid, png, token)
-                status, err = "sent", None
+                store.shot_path(token).write_bytes(png)   # 先落盘再发信，重发不用重截
+                pipeline.send_mail(cfg, email, nickname, tid, png, token)
+                store.finish(db, email, "sent", tid)
             else:
-                status, err = "dry-run", None
-        except Exception as e:                       # 失败留痕，允许人工重放
+                store.finish(db, email, "dry-run")
+        except Exception as e:                            # 失败留痕，后台可手工重试
             log.exception("申领失败 %s", email)
-            status, err, tid = "failed", str(e)[:500], None
-        with db:
-            db.execute("UPDATE claim SET status=?, ticket_id=?, error=? WHERE email=?",
-                       (status, tid, err, email))
-        log.info("%s %s %s", email, status, tid or "")
+            store.finish(db, email, "failed", error=str(e)[:500])
+        log.info("job done %s -> %s", email, store.by_email(db, email)["status"])
 
 
-def resend(db, email):
-    """按邮箱重发 —— 结果只进本人信箱，所以不泄露任何东西。"""
-    row = db.execute(
-        "SELECT nickname, ticket_id, token FROM claim WHERE email=? AND status='sent'",
-        (email.strip().lower(),)).fetchone()
-    if not row:
-        return False
-    nickname, tid, token = row
-    png = shot_path(token)
-    if not png.exists():
-        return False
-    send_mail(email, nickname, tid, png.read_bytes(), token)
-    return True
+def enqueue(email):
+    JOBS.put(email)
 
 
-PAGE = """<!doctype html><meta charset=utf-8>
-<meta name=viewport content="width=device-width,initial-scale=1">
-<title>無料チケット お申し込み</title>
-<style>body{font-family:system-ui,sans-serif;max-width:26rem;margin:3rem auto;padding:0 1rem;line-height:1.7}
-input,button{width:100%;font-size:1rem;padding:.7rem;margin:.3rem 0 1rem;box-sizing:border-box}
-button{background:#5ab9ff;color:#fff;border:0;border-radius:.4rem}small{color:#666}</style>
-<h1>無料チケット お申し込み</h1>
-<p>ニコくり周年ライブ 0822 ＠日暮里ネコシアター</p>
-"""
-
-FORM = """<form method=post action=/apply>
-<label>ニックネーム<input name=nickname required maxlength=40></label>
-<label>メールアドレス<input name=email type=email required></label>
-<button>申し込む</button>
-<small>※この無料枠は「荒川区民・女性・学生」限定です。該当する方のみお申し込みください。<br>
-※チケットは受付後、数分でメールにてお送りします。</small></form>
-<hr><h2>チケットを表示する</h2>
-<form action=/t method=get>
-<label>メールに記載のチケットコード<input name=token required minlength=16 maxlength=64
- pattern="[A-Za-z0-9_-]+" autocapitalize=off autocorrect=off spellcheck=false></label>
-<button>表示する</button></form>
-<hr><h2>メールが届かない方</h2>
-<form method=post action=/resend>
-<label>お申し込み時のメールアドレス<input name=email type=email required></label>
-<button>控えを再送する</button>
-<small>※控えはご登録のメールアドレスにのみ再送されます。</small></form>"""
-
-# ponytail: token 只做格式校验，不查库就不读盘 —— 挡住 ../ 之类的路径穿越
-TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{16,64}$")
-
-VIEW = """<h2>チケット控え（{nick} 様）</h2>
-<p><img src="/t/{token}.png" style="width:100%;border:1px solid #ddd"></p>
-<p><a href="{base}/ticket/{tid}">入場用のチケット画面を開く</a></p>
-<small>※このURLはあなた専用です。共有しないでください。<br>
-※入場時は上のリンクからご自身で開いてご提示ください。画像の提示では入場できません。</small>"""
-
+# ---------------------------------------------------------------- HTTP
 
 class Handler(BaseHTTPRequestHandler):
     db = None
+    server_version = "ticket/1.0"
 
-    def reply(self, code, body):
-        b = (PAGE + body).encode()
+    # ---- 基础
+
+    def json(self, code, obj):
+        b = json.dumps(obj, ensure_ascii=False).encode()
         self.send_response(code)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(b)))
         self.end_headers()
         self.wfile.write(b)
+
+    def blob(self, code, body, ctype, cache="no-store"):
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", cache)
+        self.end_headers()
+        self.wfile.write(body)
+
+    def static(self, name):
+        path = os.path.normpath(os.path.join(STATIC, name))
+        if not path.startswith(STATIC) or not os.path.isfile(path):
+            return self.send_error(404)
+        ctype = mimetypes.guess_type(path)[0] or "application/octet-stream"
+        with open(path, "rb") as f:
+            self.blob(200, f.read(), ctype + ("; charset=utf-8" if "text" in ctype
+                                              or "javascript" in ctype else ""))
+
+    def body(self):
+        n = int(self.headers.get("Content-Length") or 0)
+        if n > 8192:
+            raise ValueError("payload too large")
+        try:
+            return json.loads(self.rfile.read(n) or b"{}")
+        except json.JSONDecodeError:
+            return {}
+
+    # ---- 管理端鉴权
+
+    def admin_ok(self):
+        want = hmac.new(store.settings(self.db)["secret"].encode(), b"admin", "sha256").hexdigest()
+        got = ""
+        for c in (self.headers.get("Cookie") or "").split(";"):
+            k, _, v = c.strip().partition("=")
+            if k == "admin":
+                got = v
+        return hmac.compare_digest(got, want)
+
+    def need_admin(self):
+        if self.admin_ok():
+            return True
+        self.json(401, {"error": "unauthorized"})
+        return False
+
+    # ---- 路由
 
     def do_GET(self):
-        path, _, qs = self.path.partition("?")
-        if path == "/":
-            return self.reply(200, FORM)
-        if path == "/t":                                   # 首页输入框提交过来的
-            return self.serve_ticket(parse_qs(qs).get("token", [""])[0])
-        if path.startswith("/t/"):                         # 邮件里的直达链接
-            return self.serve_ticket(path[3:])
+        u = urlparse(self.path)
+        p, q = u.path, parse_qs(u.query)
+
+        if p == "/":
+            return self.static("index.html")
+        if p == "/admin":
+            return self.static("admin.html")
+        if p.startswith("/static/"):
+            return self.static(p[len("/static/"):])
+
+        if p == "/t":                                     # 首页输入框提交过来
+            return self.redirect_token(q.get("token", [""])[0])
+        if p.startswith("/t/"):
+            name = p[3:]
+            if name.endswith(".png"):
+                return self.serve_png(name[:-4])
+            return self.static("ticket.html")             # 票面数据由 JS 走 API 取
+
+        if p == "/api/config":
+            s = store.public_settings(self.db)
+            return self.json(200, {"event_title": s["event_title"],
+                                   "open": s["open"] == "1" and store.remaining(self.db) > 0,
+                                   "remaining": store.remaining(self.db),
+                                   "dry_run": s["dry_run"] == "1"})
+        if p == "/api/status":
+            return self.status(q.get("token", [""])[0])
+
+        if p == "/api/admin/claims":
+            if not self.need_admin():
+                return
+            return self.json(200, {"claims": [dict(r) for r in store.all_claims(self.db)],
+                                   "used": store.used(self.db),
+                                   "remaining": store.remaining(self.db)})
+        if p == "/api/admin/settings":
+            if not self.need_admin():
+                return
+            return self.json(200, store.public_settings(self.db))
         self.send_error(404)
 
-    def serve_ticket(self, name):
-        token, png = (name[:-4], True) if name.endswith(".png") else (name, False)
-        if not TOKEN_RE.match(token):
-            return self.send_error(404)
-        row = self.db.execute(
-            "SELECT nickname, ticket_id FROM claim WHERE token=? AND status='sent'",
-            (token,)).fetchone()
-        if not row or not shot_path(token).exists():
-            return self.send_error(404)
-        if not png:
-            return self.reply(200, VIEW.format(nick=html.escape(row[0]), token=token,
-                                               tid=row[1], base=BASE))
-        b = shot_path(token).read_bytes()
-        self.send_response(200)
-        self.send_header("Content-Type", "image/png")
-        self.send_header("Content-Length", str(len(b)))
-        self.send_header("Cache-Control", "private, no-store")
-        self.end_headers()
-        self.wfile.write(b)
-
     def do_POST(self):
-        n = int(self.headers.get("Content-Length") or 0)
-        if n > 4096:
+        p = urlparse(self.path).path
+        try:
+            data = self.body()
+        except ValueError:
             return self.send_error(413)
-        f = parse_qs(self.rfile.read(n).decode())
-        email = (f.get("email", [""])[0]).strip()
 
-        if self.path == "/resend":
-            if EMAIL_RE.match(email):
-                resend(self.db, email)
-            # 无论有没有这条记录都回同一句 —— 否则这个表单就成了邮箱存在性探测器
-            return self.reply(200, "<p>ご登録があれば、控えを再送しました。メールをご確認ください。</p>")
+        if p == "/api/apply":
+            return self.apply(data)
+        if p == "/api/resend":
+            return self.resend(data)
 
-        if self.path != "/apply":
+        if p == "/api/admin/login":
+            return self.login(data)
+        if p == "/api/admin/logout":
+            self.send_response(200)
+            self.send_header("Set-Cookie", "admin=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax")
+            self.send_header("Content-Length", "0")
+            return self.end_headers()
+
+        if not p.startswith("/api/admin/"):
             return self.send_error(404)
-        nickname = (f.get("nickname", [""])[0]).strip()[:40]
+        if not self.need_admin():
+            return
+        if p == "/api/admin/settings":
+            store.save_settings(self.db, data)
+            return self.json(200, store.public_settings(self.db))
+        if p == "/api/admin/retry":
+            row = store.by_email(self.db, data.get("email", ""))
+            if not row:
+                return self.json(404, {"error": "not found"})
+            store.finish(self.db, row["email"], "queued")
+            enqueue(row["email"])
+            return self.json(200, {"ok": True})
+        if p == "/api/admin/resend":
+            ok = self.do_resend(data.get("email", ""))
+            return self.json(200 if ok else 404, {"ok": ok})
+        self.send_error(404)
+
+    # ---- 处理器
+
+    def apply(self, data):
+        nickname = str(data.get("nickname", "")).strip()[:40]
+        email = str(data.get("email", "")).strip()
+        s = store.settings(self.db)
+        if s["open"] != "1":
+            return self.json(403, {"error": "受付は終了しました"})
         if not nickname or not EMAIL_RE.match(email):
-            return self.reply(400, "<p>入力内容をご確認ください。</p>" + FORM)
-        token = claim(self.db, email, nickname)
+            return self.json(400, {"error": "入力内容をご確認ください"})
+        if store.by_email(self.db, email):
+            return self.json(409, {"error": "このメールアドレスは既にお申し込み済みです"})
+        token = store.claim(self.db, email, nickname)
         if not token:
-            return self.reply(409, "<p>このメールアドレスは既にお申し込み済みです。</p>")
-        JOBS.put((email.lower(), nickname, token))
-        self.reply(202, f"<p>お申し込みを受け付けました、{html.escape(nickname)} 様。<br>"
-                        "数分以内にチケット画像をメールでお送りします。</p>")
+            return self.json(409, {"error": "満席のため受付を終了しました"})
+        enqueue(email.lower())
+        return self.json(202, {"token": token})
+
+    def status(self, token):
+        if not TOKEN_RE.match(token or ""):
+            return self.json(404, {"error": "not found"})
+        row = store.by_token(self.db, token)
+        if not row:
+            return self.json(404, {"error": "not found"})
+        return self.json(200, {"nickname": row["nickname"], "status": row["status"],
+                               "stage": row["stage"], "ticket_id": row["ticket_id"],
+                               "error": row["error"],
+                               "shot": store.shot_path(token).exists()})
+
+    def redirect_token(self, token):
+        if not TOKEN_RE.match(token or ""):
+            return self.send_error(404)
+        self.send_response(303)
+        self.send_header("Location", f"/t/{token}")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def serve_png(self, token):
+        if not TOKEN_RE.match(token) or not store.by_token(self.db, token):
+            return self.send_error(404)
+        f = store.shot_path(token)
+        if not f.exists():
+            return self.send_error(404)
+        self.blob(200, f.read_bytes(), "image/png", cache="private, no-store")
+
+    def do_resend(self, email):
+        row = store.by_email(self.db, email) if EMAIL_RE.match(email or "") else None
+        if not row or row["status"] != "sent":
+            return False
+        f = store.shot_path(row["token"])
+        if not f.exists():
+            return False
+        pipeline.send_mail(store.settings(self.db), row["email"], row["nickname"],
+                           row["ticket_id"], f.read_bytes(), row["token"])
+        return True
+
+    def resend(self, data):
+        try:
+            self.do_resend(str(data.get("email", "")).strip())
+        except Exception:
+            log.exception("重发失败")
+        # 有没有这条记录都回同一句 —— 否则这个接口就成了邮箱存在性探测器
+        self.json(200, {"ok": True})
+
+    def login(self, data):
+        want = os.environ.get("ADMIN_PASSWORD", "")
+        if not want or not hmac.compare_digest(str(data.get("password", "")), want):
+            return self.json(401, {"error": "パスワードが違います"})
+        tok = hmac.new(store.settings(self.db)["secret"].encode(), b"admin", "sha256").hexdigest()
+        self.send_response(200)
+        self.send_header("Set-Cookie",
+                         f"admin={tok}; Path=/; HttpOnly; SameSite=Lax; Max-Age=86400")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
 
     def log_message(self, fmt, *a):
-        log.info("%s - %s", self.address_string(), fmt % a)
+        log.info("%s %s", self.address_string(), fmt % a)
 
 
 # ---------------------------------------------------------------- 自检 / 入口
 
 def selfcheck():
-    assert pick_new({"a"}, {"a", "b"}) == "b"
-    assert pick_new({"a"}, {"a"}) is None
+    assert pipeline.pick_new({"a"}, {"a", "b"}) == "b"
+    assert pipeline.pick_new({"a"}, {"a"}) is None
     try:
-        pick_new(set(), {"a", "b"}); assert False, "多张新票必须报错"
+        pipeline.pick_new(set(), {"a", "b"}); assert False, "多张新票必须报错"
     except RuntimeError:
         pass
-    db = open_db(":memory:")
-    tok = claim(db, "A@x.com", "太郎")
+    db = store.connect(":memory:")
+    store.save_settings(db, {"capacity": "2", "td_password": "p1"})
+    assert store.settings(db)["td_password"] == "p1"
+    store.save_settings(db, {"td_password": ""})
+    assert store.settings(db)["td_password"] == "p1", "留空不得清掉已存口令"
+    assert "td_password" not in store.public_settings(db), "口令不得出现在 API 响应里"
+    assert store.public_settings(db)["td_password_set"] is True
+    tok = store.claim(db, "A@x.com", "太郎")
     assert TOKEN_RE.match(tok)
-    assert claim(db, "a@x.com", "次郎") is None, "同一邮箱不得重复占名额"
+    assert store.claim(db, "a@x.com", "次郎") is None, "同一邮箱不得重复占名额"
+    assert store.claim(db, "b@x.com", "花子") and store.remaining(db) == 0
+    assert store.claim(db, "c@x.com", "三郎") is None, "名额用尽必须拒绝"
+    store.finish(db, "b@x.com", "failed", error="boom")
+    assert store.remaining(db) == 1, "失败的应释放名额"
     assert EMAIL_RE.match("a.b+c@d.co.jp") and not EMAIL_RE.match("a@b")
     for bad in ("../../etc/passwd", "a/b", "short", ""):
         assert not TOKEN_RE.match(bad), bad
@@ -375,10 +310,10 @@ if __name__ == "__main__":
     if "--selfcheck" in sys.argv:
         selfcheck()
         sys.exit()
-    for k in ("TD_EMAIL", "TD_PASSWORD", "MAIL_FROM", "SMTP_HOST", "SMTP_USER", "SMTP_PASS"):
-        env(k)
-    SHOTS.mkdir(parents=True, exist_ok=True)
-    Handler.db = open_db(DB_PATH)
-    threading.Thread(target=worker, args=(Handler.db,), daemon=True).start()  # 单线程 = 串行
-    log.info("listening on :%s  dry_run=%s", PORT, DRY_RUN)
+    if not os.environ.get("ADMIN_PASSWORD"):
+        sys.exit("缺少环境变量 ADMIN_PASSWORD")
+    store.SHOTS.mkdir(parents=True, exist_ok=True)
+    Handler.db = store.connect()
+    threading.Thread(target=worker, args=(Handler.db,), daemon=True).start()
+    log.info("listening on :%s", PORT)
     ThreadingHTTPServer(("", PORT), Handler).serve_forever()

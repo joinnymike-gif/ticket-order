@@ -1,0 +1,63 @@
+:root {
+  --blue: #5ab9ff; --blue-d: #2b9bf0; --b1: #1a1d21; --b2: #5b6570; --b3: #98a2ad;
+  --line: #e3e8ee; --bg: #f6f8fb; --card: #fff; --ok: #16a34a; --ng: #dc2626; --warn: #d97706;
+}
+@media (prefers-color-scheme: dark) {
+  :root { --b1:#e9edf2; --b2:#a3adb8; --b3:#6b7580; --line:#2a3038; --bg:#14171b; --card:#1c2027 }
+}
+* { box-sizing: border-box }
+body {
+  margin: 0; background: var(--bg); color: var(--b1); line-height: 1.7;
+  font-family: system-ui, -apple-system, "Hiragino Sans", "Noto Sans JP", sans-serif;
+}
+.wrap { max-width: 30rem; margin: 0 auto; padding: 1.5rem 1rem 4rem }
+.wrap.wide { max-width: 64rem }
+header { background: var(--card); border-bottom: 1px solid var(--line) }
+header .wrap { padding: 1rem; display: flex; justify-content: space-between; align-items: center }
+header b { font-size: 1.05rem }
+header a { color: var(--b3); font-size: .85rem; text-decoration: none }
+h1 { font-size: 1.35rem; margin: .2rem 0 .4rem }
+h2 { font-size: 1.05rem; margin: 2rem 0 .6rem }
+.sub { color: var(--b2); font-size: .9rem; margin: 0 0 1.5rem }
+.card { background: var(--card); border: 1px solid var(--line); border-radius: .8rem; padding: 1.2rem; margin-bottom: 1rem }
+label { display: block; font-size: .85rem; font-weight: 600; color: var(--b2); margin-bottom: .3rem }
+input, select { width: 100%; padding: .7rem .8rem; font-size: 1rem; color: var(--b1);
+  background: var(--bg); border: 1px solid var(--line); border-radius: .5rem }
+input:focus, select:focus { outline: 2px solid var(--blue); border-color: transparent }
+.field { margin-bottom: 1rem }
+button { width: 100%; padding: .8rem; font-size: 1rem; font-weight: 600; color: #fff;
+  background: var(--blue); border: 0; border-radius: .5rem; cursor: pointer }
+button:hover { background: var(--blue-d) }
+button:disabled { background: var(--b3); cursor: not-allowed }
+button.ghost { background: transparent; color: var(--b2); border: 1px solid var(--line) }
+button.ghost:hover { background: var(--bg) }
+button.sm { width: auto; padding: .35rem .7rem; font-size: .8rem }
+small, .note { display: block; color: var(--b3); font-size: .8rem; line-height: 1.6 }
+.msg { padding: .8rem 1rem; border-radius: .5rem; margin-bottom: 1rem; font-size: .9rem }
+.msg.err { background: #fee2e2; color: #991b1b }
+.msg.ok { background: #dcfce7; color: #14532d }
+.msg.warn { background: #fef3c7; color: #92400e }
+.pill { display: inline-block; padding: .15rem .55rem; border-radius: 1rem; font-size: .75rem; font-weight: 600 }
+.pill.sent { background: #dcfce7; color: #14532d }
+.pill.failed { background: #fee2e2; color: #991b1b }
+.pill.queued, .pill.login, .pill.select, .pill.apply, .pill.issue, .pill.shot { background: #dbeafe; color: #1e40af }
+.pill.dry-run { background: #fef3c7; color: #92400e }
+/* 进度条 */
+.steps { list-style: none; padding: 0; margin: 0 }
+.steps li { display: flex; align-items: center; gap: .7rem; padding: .35rem 0; color: var(--b3); font-size: .9rem }
+.steps li .dot { width: 1.1rem; height: 1.1rem; border-radius: 50%; border: 2px solid var(--line); flex: 0 0 auto }
+.steps li.done { color: var(--b2) }
+.steps li.done .dot { background: var(--ok); border-color: var(--ok) }
+.steps li.now { color: var(--b1); font-weight: 600 }
+.steps li.now .dot { border-color: var(--blue); animation: pulse 1.2s infinite }
+@keyframes pulse { 50% { box-shadow: 0 0 0 .35rem rgba(90,185,255,.25) } }
+table { width: 100%; border-collapse: collapse; font-size: .85rem }
+th, td { text-align: left; padding: .55rem .5rem; border-bottom: 1px solid var(--line); vertical-align: top }
+th { color: var(--b2); font-size: .78rem; white-space: nowrap }
+td.mono { font-family: ui-monospace, Menlo, monospace; font-size: .78rem; word-break: break-all }
+.scroll { overflow-x: auto }
+.row { display: flex; gap: .5rem; align-items: center }
+.grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem }
+@media (max-width: 30rem) { .grid2 { grid-template-columns: 1fr } }
+img.shot { width: 100%; border: 1px solid var(--line); border-radius: .5rem }
+.hide { display: none }

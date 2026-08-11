@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex,nofollow">
+<title>管理画面</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header><div class="wrap wide"><b>管理画面</b>
+  <a href="#" id="logout" class="hide">ログアウト</a></div></header>
+
+<!-- ログイン -->
+<div class="wrap" id="loginBox">
+  <h1>ログイン</h1>
+  <div class="card">
+    <div id="loginErr" class="msg err hide"></div>
+    <form id="loginForm">
+      <div class="field">
+        <label for="pw">管理パスワード</label>
+        <input id="pw" type="password" required autocomplete="current-password">
+      </div>
+      <button>ログイン</button>
+    </form>
+  </div>
+</div>
+
+<!-- 本体 -->
+<div class="wrap wide hide" id="main">
+  <h1>受付状況</h1>
+  <p class="sub" id="counts"></p>
+
+  <h2>設定</h2>
+  <div class="card">
+    <div id="saved" class="msg ok hide">保存しました。</div>
+    <form id="cfgForm">
+      <div class="grid2">
+        <div class="field">
+          <label for="open">受付</label>
+          <select id="open"><option value="1">受付中</option><option value="0">停止</option></select>
+        </div>
+        <div class="field">
+          <label for="dry_run">動作モード</label>
+          <select id="dry_run">
+            <option value="1">テスト（申込を確定しない）</option>
+            <option value="0">本番（実際に申し込む）</option>
+          </select>
+        </div>
+        <div class="field"><label for="capacity">名額上限</label>
+          <input id="capacity" type="number" min="0" required></div>
+        <div class="field"><label for="event_title">イベント名</label>
+          <input id="event_title" required></div>
+        <div class="field"><label for="event_slug">イベント slug</label>
+          <input id="event_slug" required></div>
+        <div class="field"><label for="ticket_name">券種名（前方一致）</label>
+          <input id="ticket_name" required></div>
+        <div class="field"><label for="artist_answer">「お目当ての出演者」の回答</label>
+          <input id="artist_answer" required></div>
+      </div>
+
+      <h2>TicketDive アカウント</h2>
+      <small style="margin-bottom:.8rem">このアカウントで全ての申し込みを行います。</small>
+      <div class="grid2">
+        <div class="field"><label for="td_email">メールアドレス</label>
+          <input id="td_email" type="email" autocomplete="off"></div>
+        <div class="field"><label for="td_password">パスワード <span id="pwSet"></span></label>
+          <input id="td_password" type="password" autocomplete="new-password"
+                 placeholder="変更する場合のみ入力"></div>
+      </div>
+      <button>保存する</button>
+    </form>
+  </div>
+
+  <h2>申込一覧</h2>
+  <div class="card scroll">
+    <table>
+      <thead><tr>
+        <th>受付日時</th><th>ニックネーム</th><th>メール</th><th>状態</th>
+        <th>チケットID</th><th>エラー</th><th></th>
+      </tr></thead>
+      <tbody id="rows"></tbody>
+    </table>
+  </div>
+</div>
+
+<script src="/static/admin.js"></script>
+</body>
+</html>
